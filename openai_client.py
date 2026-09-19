@@ -112,6 +112,13 @@ COMPUTER_USE_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "x": {"type": "integer", "minimum": 0, "maximum": 1000},
                 "y": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "safety_decision": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {"type": "string", "enum": ["proceed", "require_confirmation"]},
+                        "explanation": {"type": "string"},
+                    },
+                },
             },
             "required": ["x", "y"],
         },
@@ -125,6 +132,13 @@ COMPUTER_USE_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "x": {"type": "integer", "minimum": 0, "maximum": 1000},
                 "y": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "safety_decision": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {"type": "string", "enum": ["proceed", "require_confirmation"]},
+                        "explanation": {"type": "string"},
+                    },
+                },
             },
             "required": ["x", "y"],
         },
@@ -154,6 +168,13 @@ COMPUTER_USE_TOOLS: list[dict[str, Any]] = [
                 "text": {"type": "string"},
                 "press_enter": {"type": "boolean"},
                 "clear_before_typing": {"type": "boolean"},
+                "safety_decision": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {"type": "string", "enum": ["proceed", "require_confirmation"]},
+                        "explanation": {"type": "string"},
+                    },
+                },
             },
             "required": ["x", "y", "text"],
         },
@@ -164,7 +185,16 @@ COMPUTER_USE_TOOLS: list[dict[str, Any]] = [
         "description": "Press a keyboard combination (e.g. 'ctrl+s', 'alt+tab').",
         "parameters": {
             "type": "object",
-            "properties": {"keys": {"type": "string"}},
+                "properties": {
+                    "keys": {"type": "string"},
+                    "safety_decision": {
+                        "type": "object",
+                        "properties": {
+                            "decision": {"type": "string", "enum": ["proceed", "require_confirmation"]},
+                            "explanation": {"type": "string"},
+                        },
+                    },
+                },
             "required": ["keys"],
         },
     },
@@ -203,6 +233,13 @@ COMPUTER_USE_TOOLS: list[dict[str, Any]] = [
                 "y": {"type": "integer"},
                 "destination_x": {"type": "integer"},
                 "destination_y": {"type": "integer"},
+                "safety_decision": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {"type": "string", "enum": ["proceed", "require_confirmation"]},
+                        "explanation": {"type": "string"},
+                    },
+                },
             },
             "required": ["x", "y", "destination_x", "destination_y"],
         },
@@ -213,7 +250,16 @@ COMPUTER_USE_TOOLS: list[dict[str, Any]] = [
         "description": "Navigate the browser to a URL.",
         "parameters": {
             "type": "object",
-            "properties": {"url": {"type": "string"}},
+            "properties": {
+                "url": {"type": "string"},
+                "safety_decision": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {"type": "string", "enum": ["proceed", "require_confirmation"]},
+                        "explanation": {"type": "string"},
+                    },
+                },
+            },
             "required": ["url"],
         },
     },
@@ -543,23 +589,36 @@ def _parse_response(payload: dict[str, Any]) -> ChatResult:
     if not isinstance(payload, dict):
         raise BadProviderResponse("ChatGPT/Codex returned a non-object response.")
 
+    output = payload.get("output") or []
+    if not isinstance(output, list):
+        raise BadProviderResponse("ChatGPT/Codex response output was not a list.")
+
     text_chunks: list[str] = []
     tool_calls: list[ToolCall] = []
 
-    for item in payload.get("output") or []:
+    for item in output:
+        if not isinstance(item, dict):
+            raise BadProviderResponse("ChatGPT/Codex response contained an invalid output item.")
         item_type = item.get("type")
         if item_type == "message":
-            for content in item.get("content") or []:
-                if content.get("type") in ("output_text", "text") and content.get("text"):
-                    text_chunks.append(content["text"])
+            content_items = item.get("content") or []
+            if not isinstance(content_items, list):
+                raise BadProviderResponse("ChatGPT/Codex message content was not a list.")
+            for content in content_items:
+                if not isinstance(content, dict):
+                    raise BadProviderResponse("ChatGPT/Codex message contained an invalid content item.")
+                text = content.get("text")
+                if content.get("type") in ("output_text", "text") and isinstance(text, str) and text:
+                    text_chunks.append(text)
         elif item_type == "function_call":
             try:
                 args = json.loads(item.get("arguments") or "{}")
             except json.JSONDecodeError:
-                log.warning("Could not parse tool arguments: %r", item.get("arguments"))
+                raw_arguments = str(item.get("arguments") or "")
+                log.warning("Could not parse tool arguments (length=%d)", len(raw_arguments))
                 args = {}
             tool_calls.append(ToolCall(
-                name=item.get("name", ""),
+                name=str(item.get("name") or ""),
                 arguments=args,
                 call_id=item.get("call_id"),
             ))
@@ -897,30 +956,48 @@ def _parse_chat_completions(payload: dict[str, Any]) -> ChatResult:
     if not isinstance(payload, dict):
         raise BadProviderResponse("Custom API returned a non-object response.")
     choices = payload.get("choices") or []
-    if not choices:
+    if not isinstance(choices, list) or not choices:
         raise BadProviderResponse("Custom API response had no choices.")
-    message = choices[0].get("message") or {}
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise BadProviderResponse("Custom API response contained an invalid choice.")
+    message = choice.get("message") or {}
+    if not isinstance(message, dict):
+        raise BadProviderResponse("Custom API response contained an invalid message.")
 
     text = ""
     content = message.get("content")
     if isinstance(content, str):
         text = content.strip()
     elif isinstance(content, list):
-        chunks = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") in ("text", "output_text")]
+        chunks = [
+            c.get("text", "")
+            for c in content
+            if isinstance(c, dict)
+            and c.get("type") in ("text", "output_text")
+            and isinstance(c.get("text"), str)
+        ]
         text = " ".join(chunk.strip() for chunk in chunks if chunk.strip())
 
     tool_calls: list[ToolCall] = []
-    for call in message.get("tool_calls") or []:
+    raw_tool_calls = message.get("tool_calls") or []
+    if not isinstance(raw_tool_calls, list):
+        raise BadProviderResponse("Custom API tool_calls was not a list.")
+    for call in raw_tool_calls:
+        if not isinstance(call, dict):
+            raise BadProviderResponse("Custom API response contained an invalid tool call.")
         fn = call.get("function") or {}
+        if not isinstance(fn, dict):
+            raise BadProviderResponse("Custom API response contained an invalid tool function.")
         raw_args = fn.get("arguments") or "{}"
         try:
             args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
         except json.JSONDecodeError:
-            log.warning("Could not parse tool arguments: %r", raw_args)
+            log.warning("Could not parse tool arguments (length=%d)", len(str(raw_args)))
             args = {}
         tool_calls.append(ToolCall(
-            name=fn.get("name", ""),
-            arguments=args,
+            name=str(fn.get("name") or ""),
+            arguments=args if isinstance(args, dict) else {},
             call_id=call.get("id"),
         ))
     return ChatResult(text=text, tool_calls=tool_calls)
@@ -959,8 +1036,11 @@ def make_openai_client(
                 "HELPER_PROVIDER=openai_compat but base URL / API key are not set; falling back to Codex."
             )
         else:
+            endpoint_error = config.validate_api_base_url(config.API_BASE_URL)
+            if endpoint_error:
+                raise ProviderError(endpoint_error)
             provider = ChatCompletionsProvider(config.API_BASE_URL, config.API_KEY)
-            log.info("Chat provider: openai_compat (%s)", config.API_BASE_URL)
+            log.info("Chat provider: openai_compat (custom endpoint configured)")
             return OpenAIClient(
                 optional_api_key=optional_api_key,
                 custom_provider=provider,

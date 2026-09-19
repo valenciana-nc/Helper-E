@@ -1462,6 +1462,9 @@ class DashboardWindow(QWidget):
             key = self._field_value("HELPER_API_KEY")
             if not base or not key:
                 return "OpenAI-compatible needs base URL + API key"
+            base_error = config.validate_api_base_url(base)
+            if base_error:
+                return base_error
         elif provider == "anthropic":
             if not self._field_value("HELPER_ANTHROPIC_API_KEY"):
                 return "Anthropic provider needs an API key"

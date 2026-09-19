@@ -51,15 +51,51 @@ def write_env(path: Path, updates: dict[str, str]) -> None:
 
 
 def _strip_quotes(value: str) -> str:
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-        return value[1:-1]
-    return value
+    """Decode the small, deliberately conservative ``.env`` value format.
+
+    ``write_env`` quotes values containing whitespace or comment characters.
+    Double-quoted values therefore need the inverse of its escaping rules;
+    without this, an API key containing a quote was persisted in a different
+    form every time the dashboard saved settings.
+    """
+    value = value.strip()
+    if len(value) < 2 or value[0] not in ("'", '"'):
+        return value
+
+    quote = value[0]
+    if quote == "'":
+        if value.endswith("'"):
+            return value[1:-1]
+        return value
+
+    if not value.endswith('"'):
+        return value
+
+    decoded: list[str] = []
+    escaped = False
+    for char in value[1:-1]:
+        if escaped:
+            if char in ('"', "\\"):
+                decoded.append(char)
+            else:
+                # Preserve unknown escape sequences instead of silently
+                # changing user data.
+                decoded.extend(("\\", char))
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+        else:
+            decoded.append(char)
+    if escaped:
+        decoded.append("\\")
+    return "".join(decoded)
 
 
 def _format_value(value: str) -> str:
     if value == "":
         return ""
-    if any(ch in value for ch in (" ", "\t", "#", "'", '"')):
-        escaped = value.replace('"', '\\"')
+    if any(ch in value for ch in (" ", "\t", "#", "'", '"', "\\")):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
     return value

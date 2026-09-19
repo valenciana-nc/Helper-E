@@ -34,6 +34,7 @@ from config import (
 from computer_control import sleep_with_abort
 from conversation_store import ConversationStore, StoredConversation
 from help_diagnostics import HelpTargetDiagnosticSink
+from launch_safety import LaunchError, launch_target, safe_target_label
 import oauth_codex
 from ui_chat import ChatWindow
 from ui_dashboard import DashboardWindow
@@ -66,6 +67,7 @@ ALIASES = {
 }
 
 CHAT_TAP_THRESHOLD_SEC = 0.3
+CONFIRMATION_TIMEOUT_SEC = 120.0
 APP_ICON_PATH = ROOT / "assets" / "helper_logo.ico"
 CONVERSATIONS_PATH = ROOT / "data" / "conversations.json"
 
@@ -313,6 +315,7 @@ class PendingConfirmation:
     request: ConfirmationRequest
     event: Event = field(default_factory=Event)
     approved: bool = False
+    cancelled: bool = False
 
 
 class ConfirmationBroker(QObject):
@@ -322,21 +325,44 @@ class ConfirmationBroker(QObject):
         super().__init__(parent_widget)
         self._parent_widget = parent_widget
         self._gui_thread_id = get_ident()
+        self._pending_lock = Lock()
+        self._pending: dict[int, PendingConfirmation] = {}
+        self._closed = Event()
         self.confirmation_requested.connect(self._resolve_pending)
 
     def confirm(self, request: ConfirmationRequest) -> bool:
+        if self._closed.is_set():
+            return False
         pending = PendingConfirmation(request=request)
         if get_ident() == self._gui_thread_id:
             self._apply_confirmation(pending)
         else:
-            self.confirmation_requested.emit(pending)
-            pending.event.wait()
+            pending_key = id(pending)
+            with self._pending_lock:
+                self._pending[pending_key] = pending
+            try:
+                self.confirmation_requested.emit(pending)
+                if not pending.event.wait(CONFIRMATION_TIMEOUT_SEC):
+                    pending.cancelled = True
+                    pending.event.set()
+                    log.warning("Confirmation timed out; blocking action: %s", request.action)
+                    return False
+            finally:
+                with self._pending_lock:
+                    self._pending.pop(pending_key, None)
         return pending.approved
 
     def _resolve_pending(self, pending: PendingConfirmation) -> None:
+        if self._closed.is_set() or pending.cancelled:
+            pending.approved = False
+            pending.event.set()
+            return
         self._apply_confirmation(pending)
 
     def _apply_confirmation(self, pending: PendingConfirmation) -> None:
+        if pending.cancelled:
+            pending.event.set()
+            return
         pending.approved = self._show_dialog(pending.request)
         pending.event.set()
 
@@ -359,6 +385,15 @@ class ConfirmationBroker(QObject):
         )
         box.setDefaultButton(QMessageBox.StandardButton.No)
         return box.exec() == int(QMessageBox.StandardButton.Yes)
+
+    def shutdown(self) -> None:
+        self._closed.set()
+        with self._pending_lock:
+            pending = list(self._pending.values())
+        for item in pending:
+            item.cancelled = True
+            item.approved = False
+            item.event.set()
 
 
 HELP_BLOCKED_ACTIONS = frozenset(
@@ -404,7 +439,7 @@ class DesktopActionDispatcher:
             url = str(action.raw_args.get("url") or "").strip()
             if not url:
                 return self._blocked_result(action, "No URL was provided.")
-            return self._launch_target(action, url, f"Navigate to {url}.")
+            return self._launch_target(action, url, f"Navigate to {safe_target_label(url)}.")
 
         if action.name == "click_control":
             label = str(action.raw_args.get("label") or "").strip()
@@ -546,21 +581,16 @@ class DesktopActionDispatcher:
         return self._blocked_result(action, f"Unsupported action: {action.name}")
 
     def _launch_target(self, action: GuideAction, target: str, description: str) -> dict[str, object]:
-        launch_target = target or "about:blank"
+        launch_value = target or "about:blank"
         self._controller.abort_controller.checkpoint()
         try:
-            subprocess.Popen(
-                ["cmd", "/c", "start", "", launch_target],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-        except Exception as exc:
+            launch_target(launch_value)
+        except (LaunchError, OSError, ValueError) as exc:
             log.exception("Launch failed: %s", description)
             return {
                 "status": "blocked",
                 "action": action.name,
-                "target": launch_target,
+                "target": launch_value,
                 "executed": False,
                 "blocked_reason": str(exc),
             }
@@ -569,7 +599,7 @@ class DesktopActionDispatcher:
         return {
             "status": "executed",
             "action": action.name,
-            "target": launch_target,
+            "target": launch_value,
             "executed": True,
             "mode": self._controller.mode,
         }
@@ -930,6 +960,7 @@ class HelplerDesktopApp(QObject):
         if self._shutting_down:
             return
         self._shutting_down = True
+        self._confirmation_broker.shutdown()
         self._persist_active_conversation()
         if self._help_session is not None:
             self._help_session.cancel()
@@ -1229,14 +1260,22 @@ class HelplerDesktopApp(QObject):
             log.exception("Loading conversations failed")
             stored = []
 
+        # Active conversations are autosaved after each message so they survive
+        # a crash.  Keep the in-memory copy as the single live row in the
+        # dashboard, rather than rendering that same id once from disk and
+        # once as LIVE while the session is still open.
+        active = self._active_conversation
+        if active is not None:
+            stored = [conversation for conversation in stored if conversation.id != active.id]
+
         live = None
-        if self._active_conversation is not None and self._active_conversation.has_user_message():
+        if active is not None and active.has_user_message():
             live = StoredConversation(
-                id=self._active_conversation.id,
-                started_at=self._active_conversation.started_at,
-                ended_at=self._active_conversation.ended_at,
-                title=self._active_conversation.derive_title(),
-                messages=list(self._active_conversation.messages),
+                id=active.id,
+                started_at=active.started_at,
+                ended_at=active.ended_at,
+                title=active.derive_title(),
+                messages=list(active.messages),
             )
         return {"stored": stored, "live": live}
 

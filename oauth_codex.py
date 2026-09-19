@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import secrets
 import threading
 import time
@@ -207,12 +208,26 @@ def _refresh(prev: TokenSet) -> TokenSet:
 
 
 def _token_set_from_response(payload: dict, *, prev_refresh: str | None) -> TokenSet:
+    if not isinstance(payload, dict):
+        raise LoginError("Token response was not a JSON object.")
+
     access = payload.get("access_token")
-    if not access:
+    if not isinstance(access, str) or not access.strip():
         raise LoginError("Token response missing access_token.")
-    expires_in = int(payload.get("expires_in", 3600))
-    refresh = payload.get("refresh_token") or prev_refresh or ""
-    id_token = payload.get("id_token") or ""
+
+    try:
+        expires_in = float(payload.get("expires_in", 3600))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise LoginError("Token response contained an invalid expires_in value.") from exc
+    if not math.isfinite(expires_in) or expires_in <= 0:
+        raise LoginError("Token response contained an invalid expires_in value.")
+
+    refresh = payload.get("refresh_token")
+    if not isinstance(refresh, str):
+        refresh = prev_refresh or ""
+    id_token = payload.get("id_token")
+    if not isinstance(id_token, str):
+        id_token = ""
     account_id = None
     if id_token:
         claims = _decode_jwt_payload(id_token)

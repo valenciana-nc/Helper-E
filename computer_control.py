@@ -417,9 +417,14 @@ class ComputerController:
         dangerous_text = self._dangerous_text(action, payload)
         if dangerous_text is not None:
             summary = self._summarize_action(action, payload)
+            reason = (
+                "Potentially destructive content detected in the requested text."
+                if action == "type_text"
+                else f"Potentially destructive content detected: {dangerous_text!r}."
+            )
             return ConfirmationRequest(
                 action=action,
-                reason=f"Potentially destructive content detected: {dangerous_text!r}.",
+                reason=reason,
                 summary=summary,
                 payload=dict(payload),
                 foreground_window=self._foreground_window(),
@@ -486,8 +491,7 @@ class ComputerController:
 
         if action == "type_text":
             text = str(payload.get("text") or "")
-            preview = text if len(text) <= 80 else f"{text[:77]}..."
-            return f"type_text: {preview!r}"
+            return f"type_text: {len(text)} characters"
 
         if action == "key":
             keys = payload.get("keys") or []

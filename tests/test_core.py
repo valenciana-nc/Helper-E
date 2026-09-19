@@ -7,6 +7,7 @@ import time
 import unittest
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import requests
@@ -31,6 +32,7 @@ from openai_client import (
     RateLimited,
     ToolCall,
     UnsupportedModel,
+    _parse_chat_completions,
     _parse_response,
     _parse_stream_response,
 )
@@ -108,6 +110,39 @@ class EnvAliasTests(unittest.TestCase):
                 config.resolve_openai_voice_model("HELPER_TTS_MODEL", "gpt-4o-mini-tts"),
                 "gpt-4o-mini-tts",
             )
+
+
+class ConfigurationHardeningTests(unittest.TestCase):
+    def test_invalid_numeric_settings_fall_back(self) -> None:
+        with patch.object(config, "env_value", return_value="not-a-number"):
+            self.assertEqual(config._int_env("HELPER_TEST", 12, lo=1, hi=20), 12)
+            self.assertEqual(config._float_env("HELPER_TEST", 0.5, lo=0.0, hi=1.0), 0.5)
+
+        with patch.object(config, "env_value", return_value="nan"):
+            self.assertEqual(config._float_env("HELPER_TEST", 0.5, lo=0.0, hi=1.0), 0.5)
+
+    def test_numeric_settings_are_clamped(self) -> None:
+        with patch.object(config, "env_value", return_value="999"):
+            self.assertEqual(config._int_env("HELPER_TEST", 12, lo=1, hi=20), 20)
+        with patch.object(config, "env_value", return_value="-1"):
+            self.assertEqual(config._float_env("HELPER_TEST", 0.5, lo=0.0, hi=1.0), 0.0)
+
+    def test_custom_api_url_requires_tls_except_loopback(self) -> None:
+        self.assertIsNone(config.validate_api_base_url("https://router.example/v1"))
+        self.assertIsNone(config.validate_api_base_url("http://127.0.0.1:8080/v1"))
+        self.assertIsNotNone(config.validate_api_base_url("http://router.example/v1"))
+        self.assertIsNotNone(config.validate_api_base_url("https://user:secret@router.example/v1"))
+
+
+class EnvIoTests(unittest.TestCase):
+    def test_write_and_read_round_trip_special_characters(self) -> None:
+        from env_io import read_env, write_env
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".env"
+            value = 'api"key\\with # spaces'
+            write_env(path, {"HELPER_API_KEY": value})
+            self.assertEqual(read_env(path)["HELPER_API_KEY"], value)
 
 
 class FakeKeyring:
@@ -241,6 +276,14 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaises(BadProviderResponse):
             _parse_response([])  # type: ignore[arg-type]
 
+    def test_parse_response_rejects_malformed_nested_items(self) -> None:
+        with self.assertRaises(BadProviderResponse):
+            _parse_response({"output": [None]})  # type: ignore[list-item]
+
+    def test_chat_completions_parser_rejects_malformed_choice(self) -> None:
+        with self.assertRaises(BadProviderResponse):
+            _parse_chat_completions({"choices": [None]})  # type: ignore[list-item]
+
     def test_parse_response_keeps_malformed_tool_call_with_empty_args(self) -> None:
         result = _parse_response(
             {
@@ -329,6 +372,58 @@ class ProviderTests(unittest.TestCase):
         self.assertFalse(provider.body["store"])
         self.assertTrue(provider.body["stream"])
         self.assertEqual(provider.body["instructions"], "Be helpful.")
+
+    def test_gemini_parser_rejects_malformed_candidate(self) -> None:
+        from gemini_client import _parse_generate
+
+        with self.assertRaises(BadProviderResponse):
+            _parse_generate({"candidates": [None]})  # type: ignore[list-item]
+
+    def test_oauth_parser_normalizes_bad_expiry_to_login_error(self) -> None:
+        from oauth_codex import LoginError, _token_set_from_response
+
+        with self.assertRaises(LoginError):
+            _token_set_from_response(
+                {"access_token": "access", "expires_in": "not-a-number"},
+                prev_refresh=None,
+            )
+
+
+class LaunchSafetyTests(unittest.TestCase):
+    def test_shell_metacharacters_are_rejected(self) -> None:
+        from launch_safety import LaunchError, launch_target
+
+        with self.assertRaises(LaunchError):
+            launch_target("notepad & whoami")
+
+    def test_command_launch_uses_shell_free_process(self) -> None:
+        from launch_safety import launch_target
+
+        with patch("launch_safety.subprocess.Popen") as popen:
+            launch_target("notepad")
+        popen.assert_called_once()
+        self.assertFalse(popen.call_args.kwargs["shell"])
+
+    def test_automatic_helper_launches_are_allowlisted(self) -> None:
+        from launch_safety import HELP_LAUNCH_COMMANDS, LaunchError, launch_target
+
+        with self.assertRaises(LaunchError):
+            launch_target("powershell -Command whoami", allowed_commands=HELP_LAUNCH_COMMANDS)
+
+    def test_url_labels_do_not_include_query_secrets(self) -> None:
+        from launch_safety import safe_target_label
+
+        label = safe_target_label("https://user:secret@example.com/path?token=secret")
+        self.assertEqual(label, "https://example.com/path")
+        self.assertNotIn("secret", label)
+
+    def test_typed_text_summary_is_redacted(self) -> None:
+        summary = HelplerAgent._summarize_action(
+            "type_text_at",
+            {"text": "super-secret-api-key"},
+        )
+        self.assertNotIn("super-secret-api-key", summary)
+        self.assertIn("20 characters", summary)
 
 
 class AgentTests(unittest.TestCase):
@@ -553,6 +648,10 @@ class ComputerControlTests(unittest.TestCase):
         self.assertEqual(
             controller._dangerous_text("type_text", {"text": "please delete the file"}),
             "please delete the file",
+        )
+        self.assertNotIn(
+            "secret",
+            controller._summarize_action("type_text", {"text": "secret"}),
         )
 
     def test_horizontal_scroll_is_not_mapped_to_vertical(self) -> None:
@@ -822,6 +921,32 @@ class ConversationStoreTests(unittest.TestCase):
             self.assertTrue(store.delete(convo.id))
             self.assertEqual(store.load_all(), [])
             self.assertFalse(store.delete(convo.id))
+
+
+class ConversationSnapshotTests(unittest.TestCase):
+    def test_active_autosaved_conversation_is_rendered_only_as_live(self) -> None:
+        from conversation_store import ConversationStore, StoredConversation
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationStore(Path(tmp) / "conversations.json")
+            active = StoredConversation.new(started_at=1_700_001_000.0)
+            active.add_message("user", "active", when=1_700_001_001.0)
+            other = StoredConversation.new(started_at=1_700_000_000.0)
+            other.add_message("user", "older", when=1_700_000_001.0)
+            store.save(active)
+            store.save(other)
+
+            # The dashboard method only needs these two attributes; using a
+            # lightweight harness keeps this regression test headless.
+            app = SimpleNamespace(
+                _conversation_store=store,
+                _active_conversation=active,
+            )
+            snapshot = main.HelplerDesktopApp._conversations_snapshot(app)  # type: ignore[arg-type]
+
+            self.assertEqual([conversation.id for conversation in snapshot["stored"]], [other.id])
+            self.assertIsNotNone(snapshot["live"])
+            self.assertEqual(snapshot["live"].id, active.id)
 
 
 class HistoryScreenshotTests(unittest.TestCase):

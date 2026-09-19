@@ -314,6 +314,45 @@ class HelpSessionEndToEndTests(unittest.TestCase):
         self.assertTrue(session._click_inside_event.is_set())
         self.assertFalse(session._check_now_event.is_set())
 
+    def test_replacing_session_isolates_old_thread_state(self) -> None:
+        _qt_app()
+        first_entered = threading.Event()
+        release_first = threading.Event()
+
+        class _BlockingAgent:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def plan_next_step(self, history: Any, **_kwargs: Any) -> LiveHelpDecision:
+                self.calls += 1
+                if self.calls == 1:
+                    first_entered.set()
+                    release_first.wait(timeout=2.0)
+                return LiveHelpDecision(kind="done", message="Done.")
+
+        session = HelpSession(
+            _BlockingAgent(),  # type: ignore[arg-type]
+            _Controller(),  # type: ignore[arg-type]
+            capture_provider=lambda: _button_capture(),
+            candidate_provider=lambda _capture: [],
+        )
+
+        session.start("first")
+        first_thread = session._thread
+        self.assertIsNotNone(first_thread)
+        self.assertTrue(first_entered.wait(timeout=1.0))
+
+        session.start("second")
+        second_thread = session._thread
+        self.assertIsNotNone(second_thread)
+        release_first.set()
+
+        first_thread.join(timeout=1.0)  # type: ignore[union-attr]
+        second_thread.join(timeout=1.0)  # type: ignore[union-attr]
+        self.assertFalse(first_thread.is_alive())  # type: ignore[union-attr]
+        self.assertFalse(second_thread.is_alive())  # type: ignore[union-attr]
+        session.cancel()
+
     def test_help_session_waits_for_overlay_clear_barrier_before_capture(self) -> None:
         app = _qt_app()
         capture = _button_capture()

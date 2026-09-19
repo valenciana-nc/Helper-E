@@ -59,10 +59,19 @@ def clear() -> None:
             keyring.delete_password(service, USERNAME)
         except keyring.errors.PasswordDeleteError:
             pass
+        except Exception as exc:
+            log.warning("Could not clear token from %s: %s", service, exc)
 
 
 def _load_from_service(service: str) -> TokenSet | None:
-    raw = keyring.get_password(service, USERNAME)
+    try:
+        raw = keyring.get_password(service, USERNAME)
+    except Exception as exc:
+        # Headless/CI machines may not have a usable keyring backend. Treat
+        # that as signed-out instead of preventing the desktop app from
+        # starting.
+        log.warning("Could not read token from %s: %s", service, exc)
+        return None
     if not raw:
         return None
     try:

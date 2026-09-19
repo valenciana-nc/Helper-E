@@ -1,10 +1,12 @@
 import logging
+import math
 import os
 import sys
 from logging.handlers import RotatingFileHandler
 from collections.abc import Mapping
 from pathlib import Path
 from dotenv import load_dotenv
+from urllib.parse import urlsplit
 
 APP_NAME = "Helper"
 ROOT = Path(__file__).parent
@@ -154,6 +156,45 @@ def bool_env(name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _float_env(name: str, default: float, *, lo: float, hi: float) -> float:
+    """Read a bounded floating-point setting without breaking startup.
+
+    Configuration comes from a user-editable ``.env`` file, so malformed or
+    stale values must fall back to a safe default instead of raising during
+    module import.  Non-finite values are rejected as well because they can
+    poison downstream timing and API parameters.
+    """
+    raw = env_value(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        logging.getLogger("helper.config").warning(
+            "Ignoring invalid numeric setting %s; using the default.", name
+        )
+        return default
+    if not math.isfinite(value):
+        logging.getLogger("helper.config").warning(
+            "Ignoring non-finite numeric setting %s; using the default.", name
+        )
+        return default
+    return max(lo, min(hi, value))
+
+
+def _int_env(name: str, default: int, *, lo: int, hi: int) -> int:
+    """Read a bounded integer setting without allowing bad ``.env`` values."""
+    raw = env_value(name, str(default)).strip()
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        logging.getLogger("helper.config").warning(
+            "Ignoring invalid integer setting %s; using the default.", name
+        )
+        return default
+    if not math.isfinite(float(value)):
+        return default
+    return max(lo, min(hi, value))
+
+
 def legacy_env_keys() -> list[str]:
     return sorted(
         key
@@ -174,19 +215,19 @@ TTS_MODEL = resolve_openai_voice_model("HELPER_TTS_MODEL", TTS_MODEL_DEFAULT)
 TTS_VOICE = env_value("HELPER_TTS_VOICE", "alloy")
 SPEAK_TYPED_CHAT = bool_env("HELPER_SPEAK_TYPED_CHAT", False)
 
-AUDIO_SAMPLE_RATE = int(env_value("HELPER_AUDIO_SAMPLE_RATE", "16000"))
-AUDIO_CHANNELS = int(env_value("HELPER_AUDIO_CHANNELS", "1"))
-AUDIO_BLOCKSIZE = int(env_value("HELPER_AUDIO_BLOCKSIZE", "0"))
-AUDIO_SILENCE_THRESHOLD = int(env_value("HELPER_AUDIO_SILENCE_THRESHOLD", "700"))
-AUDIO_MIN_SECONDS = float(env_value("HELPER_AUDIO_MIN_SECONDS", "0.25"))
-AUDIO_TRIM_PAD_MS = int(env_value("HELPER_AUDIO_TRIM_PAD_MS", "150"))
+AUDIO_SAMPLE_RATE = _int_env("HELPER_AUDIO_SAMPLE_RATE", 16000, lo=8_000, hi=192_000)
+AUDIO_CHANNELS = _int_env("HELPER_AUDIO_CHANNELS", 1, lo=1, hi=8)
+AUDIO_BLOCKSIZE = _int_env("HELPER_AUDIO_BLOCKSIZE", 0, lo=0, hi=8_192)
+AUDIO_SILENCE_THRESHOLD = _int_env("HELPER_AUDIO_SILENCE_THRESHOLD", 700, lo=0, hi=32_767)
+AUDIO_MIN_SECONDS = _float_env("HELPER_AUDIO_MIN_SECONDS", 0.25, lo=0.05, hi=60.0)
+AUDIO_TRIM_PAD_MS = _int_env("HELPER_AUDIO_TRIM_PAD_MS", 150, lo=0, hi=5_000)
 
-MAX_AGENT_STEPS = int(env_value("HELPER_MAX_AGENT_STEPS", "25"))
-AGENT_TIMEOUT_SEC = int(env_value("HELPER_AGENT_TIMEOUT_SEC", "180"))
-SCREENSHOT_MAX_EDGE = int(env_value("HELPER_SCREENSHOT_MAX_EDGE", "1280"))
-HISTORY_MAX_TURNS = int(env_value("HELPER_HISTORY_MAX_TURNS", "12"))
-HISTORY_MAX_TOKENS = int(env_value("HELPER_HISTORY_MAX_TOKENS", "12000"))
-LOOP_SETTLE_SEC = max(0.0, float(env_value("HELPER_LOOP_SETTLE_MS", "350")) / 1000.0)
+MAX_AGENT_STEPS = _int_env("HELPER_MAX_AGENT_STEPS", 25, lo=1, hi=100)
+AGENT_TIMEOUT_SEC = _int_env("HELPER_AGENT_TIMEOUT_SEC", 180, lo=1, hi=3_600)
+SCREENSHOT_MAX_EDGE = _int_env("HELPER_SCREENSHOT_MAX_EDGE", 1_280, lo=64, hi=8_192)
+HISTORY_MAX_TURNS = _int_env("HELPER_HISTORY_MAX_TURNS", 12, lo=1, hi=1_000)
+HISTORY_MAX_TOKENS = _int_env("HELPER_HISTORY_MAX_TOKENS", 12_000, lo=1, hi=200_000)
+LOOP_SETTLE_SEC = _float_env("HELPER_LOOP_SETTLE_MS", 350.0, lo=0.0, hi=60_000.0) / 1000.0
 USE_ROUTE_CLASSIFIER = bool_env("HELPER_ROUTE_CLASSIFIER", True)
 
 API_BASE_URL = env_value("HELPER_API_BASE_URL", "").strip().rstrip("/")
@@ -196,32 +237,6 @@ API_MODEL = env_value("HELPER_API_MODEL", "").strip()
 PROVIDER = env_value("HELPER_PROVIDER", "codex").strip().lower() or "codex"
 ANTHROPIC_API_KEY = env_value("HELPER_ANTHROPIC_API_KEY", "").strip()
 GEMINI_API_KEY = env_value("HELPER_GEMINI_API_KEY", "").strip()
-
-
-def _float_env(name: str, default: float, *, lo: float, hi: float) -> float:
-    raw = env_value(name, str(default)).strip()
-    try:
-        v = float(raw)
-    except ValueError:
-        return default
-    if v < lo:
-        return lo
-    if v > hi:
-        return hi
-    return v
-
-
-def _int_env(name: str, default: int, *, lo: int, hi: int) -> int:
-    raw = env_value(name, str(default)).strip()
-    try:
-        v = int(float(raw))
-    except ValueError:
-        return default
-    if v < lo:
-        return lo
-    if v > hi:
-        return hi
-    return v
 
 
 TEMPERATURE = _float_env("HELPER_TEMPERATURE", 0.7, lo=0.0, hi=2.0)
@@ -261,6 +276,31 @@ PROVIDER_LABELS: dict[str, str] = {
 
 def custom_api_enabled() -> bool:
     return bool(API_BASE_URL and API_KEY)
+
+
+def validate_api_base_url(value: str) -> str | None:
+    """Return a user-facing error for an unsafe custom API endpoint.
+
+    Plain HTTP is allowed only for loopback development routers.  Remote
+    endpoints must use TLS because the configured API key is sent in a bearer
+    header on every request.
+    """
+    raw = (value or "").strip().rstrip("/")
+    if not raw:
+        return "API base URL is required"
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return "API base URL is malformed"
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if parsed.username or parsed.password:
+        return "API base URL must not include embedded credentials"
+    if scheme == "https" and parsed.netloc:
+        return None
+    if scheme == "http" and host in {"localhost", "127.0.0.1", "::1"} and parsed.netloc:
+        return None
+    return "API base URL must use HTTPS (or HTTP on localhost only)"
 
 
 DESTRUCTIVE_KEYWORDS = ("delete", "remove", "rm ", "send", "buy", "purchase", "format", "shutdown")

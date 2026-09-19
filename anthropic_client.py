@@ -308,7 +308,7 @@ def _parse_messages(payload: dict[str, Any]) -> ChatResult:
         btype = block.get("type")
         if btype == "text":
             t = block.get("text") or ""
-            if t.strip():
+            if isinstance(t, str) and t.strip():
                 text_chunks.append(t.strip())
         elif btype == "tool_use":
             raw_args = block.get("input") or {}
@@ -318,7 +318,7 @@ def _parse_messages(payload: dict[str, Any]) -> ChatResult:
                 except json.JSONDecodeError:
                     raw_args = {}
             tool_calls.append(ToolCall(
-                name=block.get("name", ""),
+                name=str(block.get("name") or ""),
                 arguments=raw_args if isinstance(raw_args, dict) else {},
                 call_id=block.get("id"),
             ))

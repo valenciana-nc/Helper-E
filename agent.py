@@ -27,6 +27,7 @@ from fast_actions import (
 )
 from control_inventory import ControlCandidate, format_candidates_for_prompt
 from history import HistoryManager
+from launch_safety import safe_target_label
 from openai_client import ChatResult, OpenAIClient, ToolCall, make_openai_client
 from screen import Capture, capture_virtual_desktop
 
@@ -865,10 +866,10 @@ class HelplerAgent:
         if name in fixed_summaries:
             return fixed_summaries[name]
         if name == "navigate":
-            return f"Navigate to {args.get('url', 'the requested URL')}."
+            return f"Navigate to {safe_target_label(args.get('url', 'the requested URL'))}."
         if name == "type_text_at":
-            text = args.get("text", "")
-            return f"Type '{text}' at the highlighted location."
+            text = str(args.get("text", ""))
+            return f"Type {len(text)} characters at the highlighted location."
         if name == "key_combination":
             return f"Press {args.get('keys', 'the requested key combination')}."
         if name == "scroll_document":

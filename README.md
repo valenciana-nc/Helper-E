@@ -23,7 +23,7 @@ The goal is a helper that feels always available but stays out of the way: quick
 ## Setup
 
 ```powershell
-cd $env:USERPROFILE\Helper
+cd $env:USERPROFILE\helperEngine
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 copy .env.example .env
 ```
@@ -101,3 +101,15 @@ over the screenshot so monitor/DPI alignment can be inspected.
 `help_precision_selftest` opens a known local test window, captures it, resolves
 the Save button through the same Help targeting pipeline, and writes pass/fail
 artifacts.
+
+## Development checks
+
+From the project root on Windows:
+
+```powershell
+python -m ruff check .
+python -m compileall -q -x ".*\.venv.*" .
+python -m unittest discover -s tests -p "test*.py"
+```
+
+Pull requests run the same checks on Windows through GitHub Actions.

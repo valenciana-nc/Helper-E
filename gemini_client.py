@@ -264,25 +264,35 @@ def _parse_generate(payload: dict[str, Any]) -> ChatResult:
     if not isinstance(payload, dict):
         raise BadProviderResponse("Gemini returned a non-object response.")
     candidates = payload.get("candidates") or []
-    if not candidates:
+    if not isinstance(candidates, list) or not candidates:
         # Possible promptFeedback block from safety filters.
         feedback = payload.get("promptFeedback") or {}
-        if feedback.get("blockReason"):
+        if isinstance(feedback, dict) and feedback.get("blockReason"):
             raise BadProviderResponse(
                 f"Gemini blocked the prompt: {feedback.get('blockReason')}"
             )
         raise BadProviderResponse("Gemini response had no candidates.")
-    content = (candidates[0] or {}).get("content") or {}
+    candidate = candidates[0]
+    if not isinstance(candidate, dict):
+        raise BadProviderResponse("Gemini response contained an invalid candidate.")
+    content = candidate.get("content") or {}
+    if not isinstance(content, dict):
+        raise BadProviderResponse("Gemini candidate content was not an object.")
     parts = content.get("parts") or []
+    if not isinstance(parts, list):
+        raise BadProviderResponse("Gemini candidate parts was not a list.")
     text_chunks: list[str] = []
     tool_calls: list[ToolCall] = []
     for part in parts:
         if not isinstance(part, dict):
             continue
-        if "text" in part and part["text"]:
-            text_chunks.append(part["text"].strip())
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            text_chunks.append(text.strip())
         elif "functionCall" in part:
             fc = part["functionCall"] or {}
+            if not isinstance(fc, dict):
+                raise BadProviderResponse("Gemini response contained an invalid function call.")
             args = fc.get("args") or {}
             if isinstance(args, str):
                 try:
@@ -290,7 +300,7 @@ def _parse_generate(payload: dict[str, Any]) -> ChatResult:
                 except json.JSONDecodeError:
                     args = {}
             tool_calls.append(ToolCall(
-                name=fc.get("name", ""),
+                name=str(fc.get("name") or ""),
                 arguments=args if isinstance(args, dict) else {},
                 call_id=fc.get("name"),
             ))

@@ -4,10 +4,9 @@ import io
 import json
 import logging
 import re
-import subprocess
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from threading import Event, Thread
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -35,6 +34,7 @@ from help_intents import (
     tokens_from_text as _tokens_from_text,
 )
 from history import HistoryManager
+from launch_safety import HELP_LAUNCH_COMMANDS, LaunchError, launch_target, safe_target_label
 from ocr_text import (
     OcrTextProvider,
     OcrTextVerification,
@@ -2376,6 +2376,16 @@ def _intersection_rect(
     return (ix1, iy1, ix2 - ix1, iy2 - iy1)
 
 
+@dataclass
+class _HelpRun:
+    """Per-thread state so a replacement session cannot steal old events."""
+
+    cancelled: Event = field(default_factory=Event)
+    click_inside: Event = field(default_factory=Event)
+    check_now: Event = field(default_factory=Event)
+    thread: Thread | None = None
+
+
 class HelpSession(QObject):
     ghost_clear = pyqtSignal()
     highlight_show = pyqtSignal(int, int, int, int, str)
@@ -2416,14 +2426,24 @@ class HelpSession(QObject):
         self._cancelled = Event()
         self._click_inside_event = Event()
         self._check_now_event = Event()
+        self._run_lock = threading.RLock()
+        self._current_run: _HelpRun | None = None
+        self._run_local = threading.local()
         self._active_rect: tuple[int, int, int, int] | None = None
         self._rect_lock = threading.Lock()
 
     def cancel(self) -> None:
-        self._cancelled.set()
-        self._click_inside_event.set()
-        self._check_now_event.set()
-        thread = self._thread
+        with self._run_lock:
+            run = self._current_run
+            thread = run.thread if run is not None else self._thread
+        if run is not None:
+            run.cancelled.set()
+            run.click_inside.set()
+            run.check_now.set()
+        else:
+            self._cancelled.set()
+            self._click_inside_event.set()
+            self._check_now_event.set()
         if (
             thread is not None
             and thread.is_alive()
@@ -2441,8 +2461,12 @@ class HelpSession(QObject):
         """
         with self._rect_lock:
             rect = self._active_rect
+        with self._run_lock:
+            run = self._current_run
+        click_inside_event = run.click_inside if run is not None else self._click_inside_event
+        check_now_event = run.check_now if run is not None else self._check_now_event
         if rect is None:
-            self._check_now_event.set()
+            check_now_event.set()
             return
         rx, ry, rw, rh = rect
         margin = click_hit_margin(rect)
@@ -2451,26 +2475,57 @@ class HelpSession(QObject):
             and (ry - margin) <= screen_y < (ry + rh + margin)
         )
         if inside:
-            self._click_inside_event.set()
+            click_inside_event.set()
         else:
-            self._check_now_event.set()
+            check_now_event.set()
 
     def start(self, message: str) -> None:
         self.cancel()
-        self._cancelled = Event()
-        self._click_inside_event = Event()
-        self._check_now_event = Event()
-        self._thread = Thread(target=self._run, args=(message,), daemon=True)
-        self._thread.start()
+        run = _HelpRun()
+        self._cancelled = run.cancelled
+        self._click_inside_event = run.click_inside
+        self._check_now_event = run.check_now
+        thread = Thread(target=self._run, args=(message, run), daemon=True)
+        run.thread = thread
+        with self._run_lock:
+            self._current_run = run
+            self._thread = thread
+        thread.start()
 
-    def _run(self, message: str) -> None:
+    def _run(self, message: str, run: _HelpRun | None = None) -> None:
+        if run is None:
+            with self._run_lock:
+                run = self._current_run
+            if run is None:
+                run = _HelpRun(thread=threading.current_thread())
+        self._run_local.context = run
         try:
             self._run_walkthrough(message)
         except Exception as exc:
-            if self._thread is not threading.current_thread():
+            if not self._is_current_run(run):
                 return
             log.exception("Help session crashed")
             self.failed.emit(f"Helper walkthrough failed: {exc}")
+        finally:
+            with self._run_lock:
+                if self._current_run is run:
+                    self._current_run = None
+                    self._thread = None
+            try:
+                del self._run_local.context
+            except AttributeError:
+                pass
+
+    def _run_context(self) -> _HelpRun | None:
+        run = getattr(self._run_local, "context", None)
+        if run is not None:
+            return run
+        with self._run_lock:
+            return self._current_run
+
+    def _is_current_run(self, run: _HelpRun) -> bool:
+        with self._run_lock:
+            return self._current_run is run
 
     def _run_walkthrough(self, message: str) -> None:
         if self._aborted():
@@ -3008,33 +3063,39 @@ class HelpSession(QObject):
         return capture, candidates, target
 
     def _collect_candidates(self, capture: "Capture") -> list[ControlCandidate]:
+        run = self._run_context()
+        cancelled = run.cancelled if run is not None else self._cancelled
         for attempt in range(CANDIDATE_EMPTY_RETRIES + 1):
             candidates = self._candidate_provider(capture)
             if candidates or attempt >= CANDIDATE_EMPTY_RETRIES or self._aborted():
                 return candidates
             log.debug("Help candidate snapshot was empty; retrying before model prompt")
-            if self._cancelled.wait(CANDIDATE_EMPTY_RETRY_SEC):
+            if cancelled.wait(CANDIDATE_EMPTY_RETRY_SEC):
                 return []
         return []
 
     def _wait_for_progress(self, rect: tuple[int, int, int, int] | None) -> str:
-        self._click_inside_event.clear()
-        self._check_now_event.clear()
+        run = self._run_context()
+        cancelled = run.cancelled if run is not None else self._cancelled
+        click_inside = run.click_inside if run is not None else self._click_inside_event
+        check_now = run.check_now if run is not None else self._check_now_event
+        click_inside.clear()
+        check_now.clear()
         if rect is None:
             self._set_active_rect(None)
         deadline = time.monotonic() + IDLE_RECHECK_SEC
         while True:
-            if self._cancelled.is_set():
+            if cancelled.is_set():
                 return "cancelled"
-            if self._click_inside_event.is_set():
+            if click_inside.is_set():
                 return "clicked_inside"
-            if self._check_now_event.is_set():
-                self._check_now_event.clear()
+            if check_now.is_set():
+                check_now.clear()
                 return "clicked_elsewhere"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return "idle"
-            time.sleep(min(remaining, 0.04))
+            cancelled.wait(min(remaining, 0.04))
 
     @staticmethod
     def _outcome_after_step(decision: "LiveHelpDecision", outcome: str) -> str:
@@ -3098,10 +3159,10 @@ class HelpSession(QObject):
     def _outcome_after_helper_action(action: dict[str, Any]) -> str:
         name = str(action.get("name") or "").lower()
         if name == "launch_app":
-            target = action.get("display_name") or action.get("command") or "the app"
+            target = action.get("display_name") or safe_target_label(action.get("command"))
             return f"Helper just launched {target}. Continue from the new screen."
         if name == "open_url":
-            target = action.get("url") or "the URL"
+            target = safe_target_label(action.get("url"))
             return f"Helper just opened {target}. Continue from the new screen."
         if name == "key":
             return (
@@ -3135,7 +3196,9 @@ class HelpSession(QObject):
             log.exception("Overlay clear barrier failed")
             return
         if OVERLAY_CLEAR_SETTLE_SEC > 0:
-            self._cancelled.wait(OVERLAY_CLEAR_SETTLE_SEC)
+            run = self._run_context()
+            if run is not None:
+                run.cancelled.wait(OVERLAY_CLEAR_SETTLE_SEC)
 
     def _set_active_rect(self, rect: tuple[int, int, int, int] | None) -> None:
         with self._rect_lock:
@@ -3172,32 +3235,38 @@ class HelpSession(QObject):
                 dy = -700 if direction == "down" else 700
                 self._controller.scroll(dy, description="Walkthrough scroll.")
         except Exception:
-            log.exception("Helper action failed: %s", action)
+            log.exception(
+                "Helper action failed: %s (%s)",
+                name,
+                safe_target_label(action.get("url") or action.get("command")),
+            )
 
     @staticmethod
     def _launch(target: str) -> None:
         try:
-            subprocess.Popen(
-                ["cmd", "/c", "start", "", target],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-        except Exception:
-            log.exception("Launch failed: %s", target)
+            launch_target(target, allowed_commands=HELP_LAUNCH_COMMANDS)
+        except (LaunchError, OSError, ValueError):
+            log.exception("Launch failed: %s", safe_target_label(target))
 
     def _sleep_with_cancel(self, seconds: float) -> bool:
-        if self._cancelled.wait(seconds):
+        run = self._run_context()
+        if run is None or run.cancelled.wait(seconds):
             return True
         return self._aborted()
 
     def _aborted(self) -> bool:
-        if self._thread is not threading.current_thread():
+        run = self._run_context()
+        if run is None:
+            if self._cancelled.is_set():
+                return True
+            abort = getattr(self._controller, "abort_controller", None)
+            return bool(abort is not None and abort.is_aborted())
+        if not self._is_current_run(run):
             return True
-        if self._cancelled.is_set():
+        if run.cancelled.is_set():
             return True
         abort = getattr(self._controller, "abort_controller", None)
         if abort is not None and abort.is_aborted():
-            self._cancelled.set()
+            run.cancelled.set()
             return True
         return False
